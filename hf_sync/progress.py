@@ -21,7 +21,7 @@ class ProgressStream(io.RawIOBase):
     def __init__(self, inner, total: int, desc: str) -> None:
         super().__init__()
         self._inner = inner
-        self._bar = tqdm(
+        self._bar: tqdm | None = tqdm(
             total=total,
             unit="B",
             unit_scale=True,
@@ -44,28 +44,31 @@ class ProgressStream(io.RawIOBase):
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         pos = self._inner.seek(offset, whence)
-        # A seek(0) rewind means the source is being re-read from scratch
-        # (see RemoteReadStream) -- reset the bar to reflect that instead of
-        # showing a misleading jump backwards.
-        self._bar.n = pos
-        self._bar.refresh()
+        if self._bar is not None:
+            self._bar.n = pos
+            self._bar.refresh()
         return pos
 
     def read(self, size: int = -1) -> bytes:
         data = self._inner.read(size)
-        self._bar.update(len(data))
+        if self._bar is not None:
+            self._bar.update(len(data))
         return data
 
     def readinto(self, b) -> int:  # type: ignore[override]
         n = self._inner.readinto(b)
-        self._bar.update(n)
+        if self._bar is not None:
+            self._bar.update(n)
         return n
 
     def close(self) -> None:
+        if self._bar is None:
+            return
         self._bar.close()
         # tqdm with leave=False erases the bar on close but doesn't emit a
         # trailing newline, so the next log line would stick to the same line.
         if not self._bar.leave:
             print()
+        self._bar = None
         self._inner.close()
         super().close()

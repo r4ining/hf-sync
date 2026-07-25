@@ -135,7 +135,7 @@ def run_sync(
     for i, f in enumerate(plan.to_sync, start=1):
         logger.info("[%d/%d] syncing %s (%s bytes) ...", i, len(plan.to_sync), f.path, f"{f.size:,}")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
-        progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] {f.path}")
+        progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] ↓ {f.path}")
         try:
             # Suppress SDK print statements (e.g. ModelScope's "Committing
             # file to ...") that go to stdout and would interleave with the
