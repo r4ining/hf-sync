@@ -83,9 +83,11 @@ def run_sync(
     to_delete = plan.extra_in_target if delete else []
 
     logger.info(
-        "Plan: %d file(s) to sync, %d unchanged, %d extra in target (%s).",
-        len(plan.to_sync),
+        "Plan: source has %d file(s) total -- %d already up-to-date on target (skipped), "
+        "%d remaining to sync (upload/overwrite); %d extra file(s) exist only on target (%s).",
+        len(src_files),
         len(plan.unchanged),
+        len(plan.to_sync),
         len(plan.extra_in_target),
         f"will delete {len(to_delete)}" if delete else "not deleted",
     )
@@ -106,15 +108,16 @@ def run_sync(
         if delete
         else "（不会删除目标仓库中多余的文件）"
     )
+    progress_note = f"源仓库共 {len(src_files)} 个文件，其中 {len(plan.unchanged)} 个已存在于目标且内容一致（跳过）"
     if dst_exists:
         prompt = (
-            f"目标仓库 {dst_ref} 已存在，本次同步将向其中新增/覆盖 {len(plan.to_sync)} 个文件"
-            f"{delete_note}。是否继续？"
+            f"目标仓库 {dst_ref} 已存在，{progress_note}，本次同步将向其中新增/覆盖剩余 "
+            f"{len(plan.to_sync)} 个文件{delete_note}。是否继续？"
         )
     else:
         prompt = (
-            f"目标仓库 {dst_ref} 不存在，本次同步将创建该仓库并写入 {len(plan.to_sync)} 个文件"
-            f"{delete_note}。是否继续？"
+            f"目标仓库 {dst_ref} 不存在，{progress_note}，本次同步将创建该仓库并写入 "
+            f"{len(plan.to_sync)} 个文件{delete_note}。是否继续？"
         )
     if not assume_yes:
         if not _confirm(prompt):
