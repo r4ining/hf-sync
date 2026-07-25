@@ -63,5 +63,9 @@ class ProgressStream(io.RawIOBase):
 
     def close(self) -> None:
         self._bar.close()
+        # tqdm with leave=False erases the bar on close but doesn't emit a
+        # trailing newline, so the next log line would stick to the same line.
+        if not self._bar.leave:
+            print()
         self._inner.close()
         super().close()
