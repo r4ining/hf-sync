@@ -1,0 +1,21 @@
+[project]
+name = "hf-sync"
+version = "0.1.0"
+description = "Sync models/datasets directly between Hugging Face Hub and ModelScope without landing full files on local disk."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "huggingface_hub>=0.25.0",
+    "modelscope>=1.15.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+hf-sync = "hf_sync.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hf_sync*"]

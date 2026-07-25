@@ -1,0 +1,154 @@
+"""ModelScope Hub provider.
+
+Listing and raw file download go through ModelScope's plain REST API
+directly (documented informally, used by their own official clients such as
+the ``modelscope`` CLI and community integrations), since it lets us stream
+bytes without depending on SDK version-specific internals.
+
+Repo creation and upload are delegated to the official ``modelscope`` SDK
+(``modelscope.hub.api.HubApi``), which knows how to talk to ModelScope's
+git-lfs-like storage backend and accepts a file-like object via
+``path_or_fileobj`` -- exactly what :class:`~hf_sync.remote_stream.RemoteReadStream`
+provides.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+import requests
+
+from hf_sync.providers.base import FileMeta, Provider
+from hf_sync.remote_stream import RemoteReadStream
+
+_MS_ENDPOINT = "https://modelscope.cn"
+
+_REPO_TYPE_SEGMENT = {"model": "models", "dataset": "datasets"}
+
+
+class MSProvider(Provider):
+    name = "ms"
+
+    def __init__(self, token: Optional[str] = None, endpoint: str = _MS_ENDPOINT) -> None:
+        super().__init__(token=token)
+        self.endpoint = endpoint.rstrip("/")
+        self._hub_api = None  # lazily constructed; import is somewhat heavy
+
+    @property
+    def hub_api(self):
+        if self._hub_api is None:
+            from modelscope.hub.api import HubApi
+
+            self._hub_api = HubApi(token=self.token)
+        return self._hub_api
+
+    def _headers(self) -> dict:
+        headers = {"User-Agent": "hf-sync/0.1.0"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def repo_exists(self, repo_id: str, repo_type: str) -> bool:
+        segment = _REPO_TYPE_SEGMENT[repo_type]
+        url = f"{self.endpoint}/api/v1/{segment}/{repo_id}"
+        resp = requests.get(url, headers=self._headers())
+        return resp.status_code == 200
+
+    def ensure_repo(self, repo_id: str, repo_type: str, private: bool = False) -> None:
+        if self.repo_exists(repo_id, repo_type):
+            return
+        try:
+            self.hub_api.create_repo(repo_id=repo_id, repo_type=repo_type, private=private)
+        except TypeError:
+            # Older/newer SDK signatures differ slightly; fall back to the
+            # legacy model-only helper when repo_type isn't accepted.
+            if repo_type == "model":
+                self.hub_api.create_model(model_id=repo_id, visibility=5 if not private else 1)
+            else:
+                raise
+
+    def list_files(self, repo_id: str, repo_type: str, revision: str) -> List[FileMeta]:
+        segment = _REPO_TYPE_SEGMENT[repo_type]
+        url = f"{self.endpoint}/api/v1/{segment}/{repo_id}/repo/files"
+        resp = requests.get(
+            url,
+            params={"Revision": revision, "Recursive": "True"},
+            headers=self._headers(),
+        )
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        payload = resp.json()
+        raw_files = (payload.get("Data") or {}).get("Files") or []
+
+        files: List[FileMeta] = []
+        for entry in raw_files:
+            if entry.get("Type") == "tree":
+                continue
+            sha256 = entry.get("Sha256") or None
+            files.append(
+                FileMeta(path=entry["Path"], size=int(entry.get("Size") or 0), sha256=sha256)
+            )
+        return files
+
+    def _download_url(self, repo_id: str, repo_type: str, path: str) -> str:
+        segment = _REPO_TYPE_SEGMENT[repo_type]
+        return f"{self.endpoint}/api/v1/{segment}/{repo_id}/repo"
+
+    def open_read_stream(self, repo_id: str, repo_type: str, revision: str, path: str) -> RemoteReadStream:
+        url = self._download_url(repo_id, repo_type, path)
+        headers = self._headers()
+        params = {"Revision": revision, "FilePath": path}
+
+        def opener() -> requests.Response:
+            return requests.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
+
+        return RemoteReadStream(opener)
+
+    def upload(
+        self,
+        repo_id: str,
+        repo_type: str,
+        revision: str,
+        path_in_repo: str,
+        stream: RemoteReadStream,
+        size: int,
+        commit_message: str,
+    ) -> None:
+        self.hub_api.upload_file(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            path_or_fileobj=stream,
+            path_in_repo=path_in_repo,
+            revision=revision,
+            commit_message=commit_message,
+        )
+
+    def delete_files(
+        self,
+        repo_id: str,
+        repo_type: str,
+        revision: str,
+        paths: List[str],
+        commit_message: str,
+    ) -> None:
+        if not paths:
+            return
+        try:
+            self.hub_api.delete_files(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                paths=paths,
+                revision=revision,
+                commit_message=commit_message,
+            )
+        except TypeError:
+            # Some SDK versions don't accept revision/commit_message kwargs.
+            self.hub_api.delete_files(repo_id=repo_id, repo_type=repo_type, paths=paths)
+        except Exception as exc:
+            raise RuntimeError(
+                "ModelScope 删除文件失败："
+                f"{exc}. 注意：ModelScope 的 delete_files 目前要求 cookie 会话登录，"
+                "API token（ms-...）可能会被拒绝（401）。可尝试用 `modelscope login` 完成一次"
+                "浏览器登录后重试，或改到 ModelScope 网页控制台手动删除多余文件。"
+            ) from exc
