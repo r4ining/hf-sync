@@ -18,7 +18,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import List, Optional
+from typing import IO, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -184,7 +184,7 @@ class MSProvider(Provider):
         repo_type: str,
         revision: str,
         path_in_repo: str,
-        stream: RemoteReadStream,
+        stream: IO[bytes],
         size: int,
         commit_message: str,
     ) -> None:
@@ -207,7 +207,7 @@ class MSProvider(Provider):
         repo_type: str,
         revision: str,
         path_in_repo: str,
-        stream: RemoteReadStream,
+        stream: IO[bytes],
         commit_message: str,
     ) -> None:
         tmp = tempfile.NamedTemporaryFile(prefix="hf-sync-", suffix=".part", delete=False)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import IO, List, Optional
 
 from hf_sync.remote_stream import RemoteReadStream
 
@@ -49,7 +49,7 @@ class Provider(ABC):
         repo_type: str,
         revision: str,
         path_in_repo: str,
-        stream: RemoteReadStream,
+        stream: IO[bytes],
         size: int,
         commit_message: str,
     ) -> None:

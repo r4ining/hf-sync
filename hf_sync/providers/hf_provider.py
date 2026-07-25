@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import IO, List, Optional
 
 import requests
 from huggingface_hub import CommitOperationDelete, HfApi
@@ -84,7 +84,7 @@ class HFProvider(Provider):
         repo_type: str,
         revision: str,
         path_in_repo: str,
-        stream: RemoteReadStream,
+        stream: IO[bytes],
         size: int,
         commit_message: str,
     ) -> None:

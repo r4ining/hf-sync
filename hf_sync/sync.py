@@ -136,6 +136,9 @@ def run_sync(
         logger.info("[%d/%d] syncing %s (%s bytes) ...", i, len(plan.to_sync), f.path, f"{f.size:,}")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
         progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] ↓ {f.path}")
+        # ModelScope SDK requires io.BufferedIOBase, but ProgressStream extends
+        # io.RawIOBase. Wrap it in BufferedReader to satisfy the type check.
+        buffered_stream = io.BufferedReader(progress_stream)
         try:
             # Suppress SDK print statements (e.g. ModelScope's "Committing
             # file to ...") that go to stdout and would interleave with the
@@ -146,12 +149,12 @@ def run_sync(
                     repo_type,
                     dst_revision,
                     f.path,
-                    progress_stream,
+                    buffered_stream,
                     f.size,
                     commit_message,
                 )
         finally:
-            progress_stream.close()
+            buffered_stream.close()
 
     if to_delete:
         logger.info("Deleting %d extra file(s) from target %s ...", len(to_delete), dst_ref)
