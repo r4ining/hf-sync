@@ -15,6 +15,7 @@ provides.
 from __future__ import annotations
 
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -33,6 +34,20 @@ class MSProvider(Provider):
         super().__init__(token=token)
         self.endpoint = endpoint.rstrip("/")
         self._hub_api = None  # lazily constructed; import is somewhat heavy
+        self._session = self._build_session()
+
+    def _build_session(self) -> requests.Session:
+        # ModelScope's legacy /api/v1/ endpoints (used for repo existence
+        # checks, file listing, and raw file download) authenticate private
+        # repos via an ``m_session_id`` cookie set to the token, *in addition*
+        # to the ``Authorization: Bearer`` header. Sending only the header
+        # (as we used to) silently behaves as an anonymous/public request,
+        # which made private repos look like they didn't exist.
+        session = requests.Session()
+        if self.token:
+            domain = urlparse(self.endpoint).hostname or ""
+            session.cookies.set("m_session_id", self.token, domain=domain, path="/")
+        return session
 
     @property
     def hub_api(self):
@@ -51,7 +66,7 @@ class MSProvider(Provider):
     def repo_exists(self, repo_id: str, repo_type: str) -> bool:
         segment = _REPO_TYPE_SEGMENT[repo_type]
         url = f"{self.endpoint}/api/v1/{segment}/{repo_id}"
-        resp = requests.get(url, headers=self._headers())
+        resp = self._session.get(url, headers=self._headers())
         return resp.status_code == 200
 
     def ensure_repo(self, repo_id: str, repo_type: str, private: bool = False) -> None:
@@ -70,7 +85,7 @@ class MSProvider(Provider):
     def list_files(self, repo_id: str, repo_type: str, revision: str) -> List[FileMeta]:
         segment = _REPO_TYPE_SEGMENT[repo_type]
         url = f"{self.endpoint}/api/v1/{segment}/{repo_id}/repo/files"
-        resp = requests.get(
+        resp = self._session.get(
             url,
             params={"Revision": revision, "Recursive": "True"},
             headers=self._headers(),
@@ -101,7 +116,7 @@ class MSProvider(Provider):
         params = {"Revision": revision, "FilePath": path}
 
         def opener() -> requests.Response:
-            return requests.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
+            return self._session.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
 
         return RemoteReadStream(opener)
 
