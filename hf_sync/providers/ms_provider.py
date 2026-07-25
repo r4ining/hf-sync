@@ -14,6 +14,7 @@ provides.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -28,6 +29,8 @@ from hf_sync.remote_stream import RemoteReadStream
 _MS_ENDPOINT = "https://modelscope.cn"
 
 _REPO_TYPE_SEGMENT = {"model": "models", "dataset": "datasets"}
+
+logger = logging.getLogger("hf_sync")
 
 # modelscope_hub's upload_file() calls ``path_or_fileobj.read()`` in a single
 # shot to compute the content hash whenever it's given anything other than a
@@ -173,6 +176,7 @@ class MSProvider(Provider):
             path_in_repo=path_in_repo,
             revision=revision,
             commit_message=commit_message,
+            disable_tqdm=True,
         )
 
     def _upload_via_temp_file(
@@ -189,6 +193,7 @@ class MSProvider(Provider):
         try:
             with tmp:
                 shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)
+            logger.info("Uploading %s to ModelScope from local temp file ...", path_in_repo)
             self.hub_api.upload_file(
                 repo_id=repo_id,
                 repo_type=repo_type,
@@ -196,6 +201,7 @@ class MSProvider(Provider):
                 path_in_repo=path_in_repo,
                 revision=revision,
                 commit_message=commit_message,
+                disable_tqdm=True,
             )
         finally:
             try:

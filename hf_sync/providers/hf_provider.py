@@ -7,12 +7,23 @@ from typing import List, Optional
 import requests
 from huggingface_hub import CommitOperationDelete, HfApi
 from huggingface_hub.hf_api import RepoFile
-from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+    disable_progress_bars,
+)
 
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.remote_stream import RemoteReadStream
 
 _HF_ENDPOINT = "https://huggingface.co"
+
+# huggingface_hub shows its own tqdm progress bar for uploads/downloads by
+# default. We already render a single unified progress bar per file via
+# hf_sync.progress.ProgressStream, so disable the SDK's own bars to avoid two
+# competing tqdm instances fighting over the terminal line.
+disable_progress_bars()
 
 
 class HFProvider(Provider):
