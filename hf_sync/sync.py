@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 from dataclasses import dataclass
 from typing import List
@@ -135,15 +137,19 @@ def run_sync(
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
         progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] {f.path}")
         try:
-            dst.upload(
-                dst_ref.repo_id,
-                repo_type,
-                dst_revision,
-                f.path,
-                progress_stream,
-                f.size,
-                commit_message,
-            )
+            # Suppress SDK print statements (e.g. ModelScope's "Committing
+            # file to ...") that go to stdout and would interleave with the
+            # tqdm progress bar on stderr without a separating newline.
+            with contextlib.redirect_stdout(io.StringIO()):
+                dst.upload(
+                    dst_ref.repo_id,
+                    repo_type,
+                    dst_revision,
+                    f.path,
+                    progress_stream,
+                    f.size,
+                    commit_message,
+                )
         finally:
             progress_stream.close()
 

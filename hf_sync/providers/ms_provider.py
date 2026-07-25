@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -215,6 +216,12 @@ class MSProvider(Provider):
         try:
             with tmp:
                 shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)
+            # The ProgressStream wrapping `stream` has a tqdm bar on stderr
+            # that is now at 100% but not yet closed (close() happens in
+            # sync.py's finally block). Without a newline, the log line below
+            # would stick to the end of the progress bar.
+            sys.stderr.write("\n")
+            sys.stderr.flush()
             logger.info("Uploading %s to ModelScope from local temp file ...", path_in_repo)
             self.hub_api.upload_file(
                 repo_id=repo_id,
