@@ -84,7 +84,11 @@ class MSProvider(Provider):
 
     def list_files(self, repo_id: str, repo_type: str, revision: str) -> List[FileMeta]:
         segment = _REPO_TYPE_SEGMENT[repo_type]
-        url = f"{self.endpoint}/api/v1/{segment}/{repo_id}/repo/files"
+        # Models/studios list via ".../repo/files"; datasets use ".../repo/tree"
+        # instead -- the "files" endpoint returns 405 Method Not Allowed for
+        # dataset repos.
+        suffix = "repo/tree" if repo_type == "dataset" else "repo/files"
+        url = f"{self.endpoint}/api/v1/{segment}/{repo_id}/{suffix}"
         resp = self._session.get(
             url,
             params={"Revision": revision, "Recursive": "True"},
@@ -94,17 +98,34 @@ class MSProvider(Provider):
             return []
         resp.raise_for_status()
         payload = resp.json()
-        raw_files = (payload.get("Data") or {}).get("Files") or []
+        raw_files = self._extract_files(payload)
 
         files: List[FileMeta] = []
         for entry in raw_files:
-            if entry.get("Type") == "tree":
+            entry_type = entry.get("Type") or entry.get("type") or "blob"
+            if entry_type == "tree":
                 continue
-            sha256 = entry.get("Sha256") or None
-            files.append(
-                FileMeta(path=entry["Path"], size=int(entry.get("Size") or 0), sha256=sha256)
-            )
+            path = entry.get("Path") or entry.get("path") or entry.get("Name")
+            if not path:
+                continue
+            size = int(entry.get("Size") or entry.get("size") or 0)
+            sha256 = entry.get("Sha256") or entry.get("sha256") or None
+            files.append(FileMeta(path=path, size=size, sha256=sha256))
         return files
+
+    @staticmethod
+    def _extract_files(payload) -> list:
+        # Response shape varies by repo type/endpoint: a plain list, a
+        # top-level {"Files": [...]}, or nested {"Data": {"Files": [...]}}.
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            if isinstance(payload.get("Files"), list):
+                return payload["Files"]
+            data = payload.get("Data")
+            if isinstance(data, dict) and isinstance(data.get("Files"), list):
+                return data["Files"]
+        return []
 
     def _download_url(self, repo_id: str, repo_type: str, path: str) -> str:
         segment = _REPO_TYPE_SEGMENT[repo_type]
