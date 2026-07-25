@@ -104,28 +104,50 @@ class MSProvider(Provider):
         # dataset repos.
         suffix = "repo/tree" if repo_type == "dataset" else "repo/files"
         url = f"{self.endpoint}/api/v1/{segment}/{repo_id}/{suffix}"
-        resp = self._session.get(
-            url,
-            params={"Revision": revision, "Recursive": "True"},
-            headers=self._headers(),
-        )
-        if resp.status_code == 404:
-            return []
-        resp.raise_for_status()
-        payload = resp.json()
-        raw_files = self._extract_files(payload)
 
         files: List[FileMeta] = []
-        for entry in raw_files:
-            entry_type = entry.get("Type") or entry.get("type") or "blob"
-            if entry_type == "tree":
+        page_size = 100
+        page_number = 1
+        while True:
+            resp = self._session.get(
+                url,
+                params={
+                    "Revision": revision,
+                    "Recursive": "True",
+                    "PageSize": page_size,
+                    "PageNumber": page_number,
+                },
+                headers=self._headers(),
+            )
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            payload = resp.json()
+            raw_files = self._extract_files(payload)
+
+            for entry in raw_files:
+                entry_type = entry.get("Type") or entry.get("type") or "blob"
+                if entry_type == "tree":
+                    continue
+                path = entry.get("Path") or entry.get("path") or entry.get("Name")
+                if not path:
+                    continue
+                size = int(entry.get("Size") or entry.get("size") or 0)
+                sha256 = entry.get("Sha256") or entry.get("sha256") or None
+                files.append(FileMeta(path=path, size=size, sha256=sha256))
+
+            # ModelScope paginates the tree/files endpoint. Check whether
+            # there are more pages to fetch.
+            total_count = None
+            if isinstance(payload, dict):
+                total_count = payload.get("TotalCount")
+                if total_count is None and isinstance(payload.get("Data"), dict):
+                    total_count = payload["Data"].get("TotalCount")
+            if total_count is not None and len(files) < total_count and len(raw_files) > 0:
+                page_number += 1
                 continue
-            path = entry.get("Path") or entry.get("path") or entry.get("Name")
-            if not path:
-                continue
-            size = int(entry.get("Size") or entry.get("size") or 0)
-            sha256 = entry.get("Sha256") or entry.get("sha256") or None
-            files.append(FileMeta(path=path, size=size, sha256=sha256))
+            break
+
         return files
 
     @staticmethod
