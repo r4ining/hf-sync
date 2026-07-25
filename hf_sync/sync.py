@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
+from hf_sync.progress import ProgressStream
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.uri import RepoRef
 
@@ -129,18 +130,19 @@ def run_sync(
     for i, f in enumerate(plan.to_sync, start=1):
         logger.info("[%d/%d] syncing %s (%s bytes) ...", i, len(plan.to_sync), f.path, f"{f.size:,}")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
+        progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] {f.path}")
         try:
             dst.upload(
                 dst_ref.repo_id,
                 repo_type,
                 dst_revision,
                 f.path,
-                stream,
+                progress_stream,
                 f.size,
                 commit_message,
             )
         finally:
-            stream.close()
+            progress_stream.close()
 
     if to_delete:
         logger.info("Deleting %d extra file(s) from target %s ...", len(to_delete), dst_ref)

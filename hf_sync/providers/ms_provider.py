@@ -14,6 +14,9 @@ provides.
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -25,6 +28,15 @@ from hf_sync.remote_stream import RemoteReadStream
 _MS_ENDPOINT = "https://modelscope.cn"
 
 _REPO_TYPE_SEGMENT = {"model": "models", "dataset": "datasets"}
+
+# modelscope_hub's upload_file() calls ``path_or_fileobj.read()`` in a single
+# shot to compute the content hash whenever it's given anything other than a
+# str/Path/bytes (see modelscope_hub._upload._compute_file_hash) -- it does
+# NOT chunk-read a file-like object. For large files this fully buffers the
+# entire file in memory (and keeps that buffer around for the upload itself),
+# which can OOM-kill the process. Above this size we spool through a local
+# temp file instead, so the SDK takes its disk-based, chunked-hashing path.
+_LARGE_FILE_SPOOL_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
 
 
 class MSProvider(Provider):
@@ -151,6 +163,9 @@ class MSProvider(Provider):
         size: int,
         commit_message: str,
     ) -> None:
+        if size > _LARGE_FILE_SPOOL_THRESHOLD:
+            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, commit_message)
+            return
         self.hub_api.upload_file(
             repo_id=repo_id,
             repo_type=repo_type,
@@ -159,6 +174,34 @@ class MSProvider(Provider):
             revision=revision,
             commit_message=commit_message,
         )
+
+    def _upload_via_temp_file(
+        self,
+        repo_id: str,
+        repo_type: str,
+        revision: str,
+        path_in_repo: str,
+        stream: RemoteReadStream,
+        commit_message: str,
+    ) -> None:
+        tmp = tempfile.NamedTemporaryFile(prefix="hf-sync-", suffix=".part", delete=False)
+        tmp_path = tmp.name
+        try:
+            with tmp:
+                shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)
+            self.hub_api.upload_file(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                path_or_fileobj=tmp_path,
+                path_in_repo=path_in_repo,
+                revision=revision,
+                commit_message=commit_message,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def delete_files(
         self,
