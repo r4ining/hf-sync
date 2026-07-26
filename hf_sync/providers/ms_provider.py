@@ -18,6 +18,8 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
+import time
 from typing import IO, List, Optional
 from urllib.parse import urlparse
 
@@ -40,6 +42,17 @@ logger = logging.getLogger("hf_sync")
 # which can OOM-kill the process. Above this size we spool through a local
 # temp file instead, so the SDK takes its disk-based, chunked-hashing path.
 _LARGE_FILE_SPOOL_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
+
+_COMMIT_LOCK_MAX_RETRIES = 5
+_COMMIT_LOCK_BASE_DELAY = 2  # seconds
+
+# ModelScope does not allow concurrent commits to the same repo. When
+# multiple threads upload simultaneously, the server returns a 429
+# "commit lock busy" error. This lock serializes the commit phase across
+# all concurrent uploads so that only one thread commits at a time, while
+# the actual data transfer (download from source + upload to ModelScope
+# staging) can still proceed in parallel.
+_commit_lock = threading.Lock()
 
 
 class MSProvider(Provider):
@@ -191,14 +204,19 @@ class MSProvider(Provider):
         if size > _LARGE_FILE_SPOOL_THRESHOLD:
             self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, commit_message)
             return
-        self.hub_api.upload_file(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            path_or_fileobj=stream,
-            path_in_repo=path_in_repo,
-            revision=revision,
-            commit_message=commit_message,
-            disable_tqdm=True,
+        # For small files the stream is still open; we need it for the
+        # upload call. The commit lock + retry wrapper handles concurrency.
+        self._upload_with_retry(
+            lambda: self.hub_api.upload_file(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                path_or_fileobj=stream,
+                path_in_repo=path_in_repo,
+                revision=revision,
+                commit_message=commit_message,
+                disable_tqdm=True,
+            ),
+            path_in_repo,
         )
 
     def _upload_via_temp_file(
@@ -220,20 +238,54 @@ class MSProvider(Provider):
             # conflict with a stale 100% download bar on the same line.
             stream.close()
             logger.info("Uploading %s to ModelScope ...", path_in_repo)
-            self.hub_api.upload_file(
-                repo_id=repo_id,
-                repo_type=repo_type,
-                path_or_fileobj=tmp_path,
-                path_in_repo=path_in_repo,
-                revision=revision,
-                commit_message=commit_message,
-                disable_tqdm=False,
+            self._upload_with_retry(
+                lambda: self.hub_api.upload_file(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    path_or_fileobj=tmp_path,
+                    path_in_repo=path_in_repo,
+                    revision=revision,
+                    commit_message=commit_message,
+                    disable_tqdm=False,
+                ),
+                path_in_repo,
             )
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    def _upload_with_retry(self, upload_fn, path_in_repo: str) -> None:
+        """Run an upload call with a commit lock and retry on lock conflicts.
+
+        ModelScope serializes commits per-repo. Concurrent ``upload_file``
+        calls can hit a 429 "commit lock busy" error. We hold a process-wide
+        lock so only one thread commits at a time, and retry with exponential
+        backoff in case the server-side lock is still held from a previous
+        (or external) commit.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(_COMMIT_LOCK_MAX_RETRIES):
+            with _commit_lock:
+                try:
+                    upload_fn()
+                    return
+                except Exception as exc:
+                    if "commit lock busy" in str(exc).lower() or "429" in str(exc):
+                        last_exc = exc
+                        delay = _COMMIT_LOCK_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "ModelScope commit lock busy for %s, retrying in %ds (attempt %d/%d) ...",
+                            path_in_repo, delay, attempt + 1, _COMMIT_LOCK_MAX_RETRIES,
+                        )
+                    else:
+                        raise
+            time.sleep(delay)
+        raise RuntimeError(
+            f"ModelScope commit lock remained busy for {path_in_repo} after "
+            f"{_COMMIT_LOCK_MAX_RETRIES} retries"
+        ) from last_exc
 
     def delete_files(
         self,

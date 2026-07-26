@@ -7,8 +7,12 @@ import contextlib
 import io
 import logging
 import queue
+import sys
+import threading
 from dataclasses import dataclass
 from typing import List
+
+from tqdm.auto import tqdm
 
 from hf_sync.progress import ProgressStream
 from hf_sync.providers.base import FileMeta, Provider
@@ -137,13 +141,32 @@ def run_sync(
 
     concurrency = max(1, concurrency)
     total = len(plan.to_sync)
-    logger.info("Syncing %d file(s) with up to %d concurrent transfer(s) ...", total, concurrency)
+    total_bytes = sum(f.size for f in plan.to_sync)
+    logger.info("Syncing %d file(s) (%s total) with up to %d concurrent transfer(s) ...",
+                total, f"{total_bytes:,}", concurrency)
 
-    def _sync_one(f: FileMeta, index: int, position: int) -> None:
-        logger.info("[%d/%d] syncing %s (%s bytes) ...", index, total, f.path, f"{f.size:,}")
+    # In concurrent mode, install a tqdm lock so that bar updates from
+    # multiple threads don't interleave and corrupt the terminal output.
+    # Also route log messages through tqdm.write() so they appear above the
+    # progress bars instead of overwriting them.
+    if concurrency > 1:
+        tqdm.set_lock(threading.Lock())
+
+    _tqdm_write_lock = threading.Lock()
+
+    def _log(msg: str) -> None:
+        if concurrency > 1:
+            with _tqdm_write_lock:
+                tqdm.write(msg, file=sys.stderr)
+        else:
+            logger.info(msg)
+
+    def _sync_one(f: FileMeta, index: int, position: int = 0) -> None:
+        _log(f"[{index}/{total}] syncing {f.path} ({f.size:,} bytes) ...")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
         progress_stream = ProgressStream(
-            stream, total=f.size, desc=f"[{index}/{total}] ↓ {f.path}", position=position
+            stream, total=f.size, desc=f"[{index}/{total}] ↓ {f.path}",
+            position=position,
         )
         # ModelScope SDK requires io.BufferedIOBase, but ProgressStream extends
         # io.RawIOBase. Wrap it in BufferedReader to satisfy the type check.
@@ -163,18 +186,18 @@ def run_sync(
 
     # Suppress SDK print statements (e.g. ModelScope's "Committing file to
     # ...") that go to stdout and would interleave with the tqdm progress
-    # bars on stderr without a separating newline. This must wrap the whole
+    # bar on stderr without a separating newline. This must wrap the whole
     # concurrent section (rather than each individual transfer) since
     # redirect_stdout mutates global process state (sys.stdout) and is not
     # safe to enter/exit concurrently from multiple threads.
     with contextlib.redirect_stdout(io.StringIO()):
         if concurrency == 1:
             for i, f in enumerate(plan.to_sync, start=1):
-                _sync_one(f, i, position=0)
+                _sync_one(f, i)
         else:
-            # Fixed-size pool of tqdm row positions (0..concurrency-1), one
-            # per in-flight transfer, so concurrent progress bars each get
-            # their own stable line instead of fighting over the same one.
+            # Each concurrent transfer gets its own tqdm row position
+            # (0..concurrency-1). A queue manages the pool of positions so
+            # that as one transfer finishes, its row is reused by the next.
             positions: "queue.Queue[int]" = queue.Queue()
             for p in range(concurrency):
                 positions.put(p)
@@ -196,7 +219,7 @@ def run_sync(
                     try:
                         future.result()
                     except Exception as exc:  # noqa: BLE001
-                        logger.error("同步文件 %s 失败：%s", f.path, exc)
+                        _log(f"同步文件 {f.path} 失败：{exc}")
                         errors.append(exc)
 
             if errors:
