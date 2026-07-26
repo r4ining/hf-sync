@@ -13,7 +13,7 @@ from typing import List
 
 from tqdm.auto import tqdm
 
-from hf_sync.progress import ProgressStream
+from hf_sync.progress import ProgressStream, set_current_position
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.uri import RepoRef
 
@@ -164,6 +164,11 @@ def run_sync(
         # ModelScope SDK requires io.BufferedIOBase, but ProgressStream extends
         # io.RawIOBase. Wrap it in BufferedReader to satisfy the type check.
         buffered_stream = io.BufferedReader(progress_stream)
+        # Record this worker thread's row position so that provider upload
+        # code (e.g. ModelScope's SDK, which creates its own tqdm bar
+        # internally for large-file uploads) can reuse the same row instead
+        # of defaulting to row 0 and colliding with other concurrent bars.
+        set_current_position(position)
         try:
             dst.upload(
                 dst_ref.repo_id,

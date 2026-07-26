@@ -24,7 +24,9 @@ from typing import IO, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from tqdm.auto import tqdm
 
+from hf_sync.progress import get_current_position
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.remote_stream import RemoteReadStream
 
@@ -54,6 +56,41 @@ _COMMIT_LOCK_BASE_DELAY = 2  # seconds
 # staging) can still proceed in parallel.
 _commit_lock = threading.Lock()
 
+# The ModelScope SDK's upload_file() creates its own tqdm progress bar
+# internally for the actual upload phase (after our own ProgressStream has
+# already finished the download-to-temp-file phase), but it hardcodes the
+# bar with no ``position`` argument -- so it always renders on row 0 and
+# stomps on other concurrent transfers' bars. Since the SDK gives us no hook
+# to pass a position, we patch tqdm's constructor (once, process-wide) to
+# fall back to the current worker thread's assigned row -- recorded via
+# ``hf_sync.progress.set_current_position()`` -- whenever the caller doesn't
+# specify one explicitly. This only affects bars created without an
+# explicit ``position``/``leave``, so our own ProgressStream bars (which
+# always pass ``position`` explicitly) are unaffected.
+_tqdm_patch_lock = threading.Lock()
+_tqdm_patched = False
+
+
+def _ensure_tqdm_position_patch() -> None:
+    global _tqdm_patched
+    if _tqdm_patched:
+        return
+    with _tqdm_patch_lock:
+        if _tqdm_patched:
+            return
+        original_init = tqdm.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            if kwargs.get("position") is None:
+                pos = get_current_position()
+                if pos is not None:
+                    kwargs["position"] = pos
+                    kwargs.setdefault("leave", False)
+            original_init(self, *args, **kwargs)
+
+        tqdm.__init__ = _patched_init
+        _tqdm_patched = True
+
 
 class MSProvider(Provider):
     name = "ms"
@@ -63,6 +100,7 @@ class MSProvider(Provider):
         self.endpoint = endpoint.rstrip("/")
         self._hub_api = None  # lazily constructed; import is somewhat heavy
         self._session = self._build_session()
+        _ensure_tqdm_position_patch()
 
     def _build_session(self) -> requests.Session:
         # ModelScope's legacy /api/v1/ endpoints (used for repo existence
@@ -204,17 +242,27 @@ class MSProvider(Provider):
         if size > _LARGE_FILE_SPOOL_THRESHOLD:
             self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, commit_message)
             return
-        # For small files the stream is still open; we need it for the
-        # upload call. The commit lock + retry wrapper handles concurrency.
+        # The SDK reads small files fully into memory anyway (it checks
+        # isinstance(path_or_fileobj, io.BufferedIOBase) and calls .read())
+        # before hashing + uploading. We do that read ourselves so our own
+        # ProgressStream (download phase) can be closed -- freeing its
+        # terminal row -- as soon as it's drained, *before* handing plain
+        # bytes to the SDK. The SDK then creates its own (position-patched)
+        # bar for the actual upload PUT. Without closing ours first, both
+        # bars would claim the same row at the same time and corrupt the
+        # terminal output.
+        data = stream.read()
+        stream.close()
         self._upload_with_retry(
             lambda: self.hub_api.upload_file(
                 repo_id=repo_id,
                 repo_type=repo_type,
-                path_or_fileobj=stream,
+                path_or_fileobj=data,
                 path_in_repo=path_in_repo,
                 revision=revision,
                 commit_message=commit_message,
-                disable_tqdm=True,
+                disable_tqdm=False,
+                tqdm_desc=f"↑ {path_in_repo}",
             ),
             path_in_repo,
         )
@@ -246,7 +294,8 @@ class MSProvider(Provider):
                     path_in_repo=path_in_repo,
                     revision=revision,
                     commit_message=commit_message,
-                    disable_tqdm=True,
+                    disable_tqdm=False,
+                    tqdm_desc=f"↑ {path_in_repo}",
                 ),
                 path_in_repo,
             )
@@ -257,31 +306,45 @@ class MSProvider(Provider):
                 pass
 
     def _upload_with_retry(self, upload_fn, path_in_repo: str) -> None:
-        """Run an upload call with a commit lock and retry on lock conflicts.
+        """Run an upload call and retry on ModelScope's commit-lock conflicts.
 
-        ModelScope serializes commits per-repo. Concurrent ``upload_file``
-        calls can hit a 429 "commit lock busy" error. We hold a process-wide
-        lock so only one thread commits at a time, and retry with exponential
-        backoff in case the server-side lock is still held from a previous
-        (or external) commit.
+        ``upload_fn`` wraps the SDK's ``upload_file()``, which does three
+        things in sequence: (1) hash the local data, (2) PUT the blob to
+        storage, (3) call ``create_commit`` to attach it to the repo.
+        ModelScope serializes step 3 *per repo* server-side and returns a
+        429 "commit lock busy" error when two commits race.
+
+        The first attempt runs with **no client-side lock** so that step 2
+        (the potentially multi-GB blob upload) can proceed fully in
+        parallel across concurrent transfers -- only step 3 is actually
+        contended. If we do hit a lock-busy error, subsequent retries are
+        serialized via ``_commit_lock`` so that only one thread retries at a
+        time, which converges much faster than every thread hammering the
+        server independently. Retries are cheap even for large files: the
+        SDK's blob upload step already dedups by content hash server-side
+        (``_validate_blob``), so a blob that was already PUT in the failed
+        attempt is not re-transferred.
         """
         last_exc: Optional[Exception] = None
         for attempt in range(_COMMIT_LOCK_MAX_RETRIES):
-            with _commit_lock:
-                try:
+            try:
+                if attempt == 0:
                     upload_fn()
-                    return
-                except Exception as exc:
-                    if "commit lock busy" in str(exc).lower() or "429" in str(exc):
-                        last_exc = exc
-                        delay = _COMMIT_LOCK_BASE_DELAY * (2 ** attempt)
-                        logger.warning(
-                            "ModelScope commit lock busy for %s, retrying in %ds (attempt %d/%d) ...",
-                            path_in_repo, delay, attempt + 1, _COMMIT_LOCK_MAX_RETRIES,
-                        )
-                    else:
-                        raise
-            time.sleep(delay)
+                else:
+                    with _commit_lock:
+                        upload_fn()
+                return
+            except Exception as exc:
+                if "commit lock busy" in str(exc).lower() or "429" in str(exc):
+                    last_exc = exc
+                    delay = _COMMIT_LOCK_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "ModelScope commit lock busy for %s, retrying in %ds (attempt %d/%d) ...",
+                        path_in_repo, delay, attempt + 1, _COMMIT_LOCK_MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
         raise RuntimeError(
             f"ModelScope commit lock remained busy for {path_in_repo} after "
             f"{_COMMIT_LOCK_MAX_RETRIES} retries"
