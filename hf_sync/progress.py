@@ -22,6 +22,7 @@ class ProgressStream(io.RawIOBase):
         super().__init__()
         self._inner = inner
         self._position = position
+        self._seek_count = 0
         self._bar: tqdm | None = tqdm(
             total=total,
             unit="B",
@@ -48,7 +49,18 @@ class ProgressStream(io.RawIOBase):
         pos = self._inner.seek(offset, whence)
         if self._bar is not None:
             self._bar.n = pos
-            self._bar.refresh()
+            # When the upload SDK rewinds to the start (seek(0)) for the
+            # second read pass (actual upload after hash computation),
+            # switch the label from download (↓) to upload (↑) so the user
+            # can distinguish the two phases.
+            if pos == 0 and self._seek_count == 0:
+                self._seek_count += 1
+                old_desc = self._bar.desc or ""
+                if "↓" in old_desc:
+                    self._bar.desc = old_desc.replace("↓", "↑")
+                    self._bar.refresh()
+            else:
+                self._bar.refresh()
         return pos
 
     def read(self, size: int = -1) -> bytes:
