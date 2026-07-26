@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete files present in the target but not in the source, to make the target an exact mirror",
     )
+    sync_p.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Number of files to transfer concurrently (parallel download+upload pipelines). Default: 5",
+    )
     sync_p.add_argument("--dry-run", action="store_true", help="Only print what would be synced")
     sync_p.add_argument("--private", action="store_true", help="Create the target repo as private if it needs creating")
     sync_p.add_argument(
@@ -102,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                 private=args.private,
                 assume_yes=args.yes,
                 delete=args.delete,
+                concurrency=args.concurrency,
             )
         except Exception as exc:  # surface a clean error instead of a traceback
             logging.error("hf-sync failed: %s", exc)

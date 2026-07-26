@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import io
 import logging
+import queue
 from dataclasses import dataclass
 from typing import List
 
@@ -70,6 +72,7 @@ def run_sync(
     private: bool = False,
     assume_yes: bool = False,
     delete: bool = False,
+    concurrency: int = 5,
 ) -> Plan:
     logger.info("Listing files on source %s ...", src_ref)
     src_files = src.list_files(src_ref.repo_id, repo_type, revision)
@@ -132,29 +135,74 @@ def run_sync(
         logger.info("Target repo %s does not exist, creating it ...", dst_ref)
         dst.ensure_repo(dst_ref.repo_id, repo_type, private=private)
 
-    for i, f in enumerate(plan.to_sync, start=1):
-        logger.info("[%d/%d] syncing %s (%s bytes) ...", i, len(plan.to_sync), f.path, f"{f.size:,}")
+    concurrency = max(1, concurrency)
+    total = len(plan.to_sync)
+    logger.info("Syncing %d file(s) with up to %d concurrent transfer(s) ...", total, concurrency)
+
+    def _sync_one(f: FileMeta, index: int, position: int) -> None:
+        logger.info("[%d/%d] syncing %s (%s bytes) ...", index, total, f.path, f"{f.size:,}")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
-        progress_stream = ProgressStream(stream, total=f.size, desc=f"[{i}/{len(plan.to_sync)}] ↓ {f.path}")
+        progress_stream = ProgressStream(
+            stream, total=f.size, desc=f"[{index}/{total}] ↓ {f.path}", position=position
+        )
         # ModelScope SDK requires io.BufferedIOBase, but ProgressStream extends
         # io.RawIOBase. Wrap it in BufferedReader to satisfy the type check.
         buffered_stream = io.BufferedReader(progress_stream)
         try:
-            # Suppress SDK print statements (e.g. ModelScope's "Committing
-            # file to ...") that go to stdout and would interleave with the
-            # tqdm progress bar on stderr without a separating newline.
-            with contextlib.redirect_stdout(io.StringIO()):
-                dst.upload(
-                    dst_ref.repo_id,
-                    repo_type,
-                    dst_revision,
-                    f.path,
-                    buffered_stream,
-                    f.size,
-                    commit_message,
-                )
+            dst.upload(
+                dst_ref.repo_id,
+                repo_type,
+                dst_revision,
+                f.path,
+                buffered_stream,
+                f.size,
+                commit_message,
+            )
         finally:
             buffered_stream.close()
+
+    # Suppress SDK print statements (e.g. ModelScope's "Committing file to
+    # ...") that go to stdout and would interleave with the tqdm progress
+    # bars on stderr without a separating newline. This must wrap the whole
+    # concurrent section (rather than each individual transfer) since
+    # redirect_stdout mutates global process state (sys.stdout) and is not
+    # safe to enter/exit concurrently from multiple threads.
+    with contextlib.redirect_stdout(io.StringIO()):
+        if concurrency == 1:
+            for i, f in enumerate(plan.to_sync, start=1):
+                _sync_one(f, i, position=0)
+        else:
+            # Fixed-size pool of tqdm row positions (0..concurrency-1), one
+            # per in-flight transfer, so concurrent progress bars each get
+            # their own stable line instead of fighting over the same one.
+            positions: "queue.Queue[int]" = queue.Queue()
+            for p in range(concurrency):
+                positions.put(p)
+
+            def _run(f: FileMeta, index: int) -> None:
+                position = positions.get()
+                try:
+                    _sync_one(f, index, position)
+                finally:
+                    positions.put(position)
+
+            errors: List[BaseException] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {
+                    executor.submit(_run, f, i): f for i, f in enumerate(plan.to_sync, start=1)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    f = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("同步文件 %s 失败：%s", f.path, exc)
+                        errors.append(exc)
+
+            if errors:
+                raise RuntimeError(
+                    f"{len(errors)}/{total} 个文件同步失败，详情见上方日志。已成功的文件下次运行会自动跳过。"
+                ) from errors[0]
 
     if to_delete:
         logger.info("Deleting %d extra file(s) from target %s ...", len(to_delete), dst_ref)

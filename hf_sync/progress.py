@@ -18,9 +18,10 @@ from tqdm.auto import tqdm
 class ProgressStream(io.RawIOBase):
     """Wraps any readable/seekable file-like object with a tqdm progress bar."""
 
-    def __init__(self, inner, total: int, desc: str) -> None:
+    def __init__(self, inner, total: int, desc: str, position: int | None = None) -> None:
         super().__init__()
         self._inner = inner
+        self._position = position
         self._bar: tqdm | None = tqdm(
             total=total,
             unit="B",
@@ -28,6 +29,7 @@ class ProgressStream(io.RawIOBase):
             unit_divisor=1024,
             desc=desc,
             leave=False,
+            position=position,
         )
 
     def readable(self) -> bool:
@@ -64,10 +66,14 @@ class ProgressStream(io.RawIOBase):
     def close(self) -> None:
         if self._bar is None:
             return
+        leave = self._bar.leave
         self._bar.close()
         # tqdm with leave=False erases the bar on close but doesn't emit a
         # trailing newline, so the next log line would stick to the same line.
-        if not self._bar.leave:
+        # Only do this for the single, non-positioned bar case: with multiple
+        # concurrent bars (position is set), printing here would shift the
+        # other bars' rows around.
+        if not leave and self._position is None:
             print()
         self._bar = None
         self._inner.close()
