@@ -7,7 +7,6 @@ import contextlib
 import io
 import logging
 import queue
-import sys
 import threading
 from dataclasses import dataclass
 from typing import List
@@ -145,24 +144,18 @@ def run_sync(
     logger.info("Syncing %d file(s) (%s total) with up to %d concurrent transfer(s) ...",
                 total, f"{total_bytes:,}", concurrency)
 
-    # In concurrent mode, install a tqdm lock so that bar updates from
-    # multiple threads don't interleave and corrupt the terminal output.
-    # Also route log messages through tqdm.write() so they appear above the
-    # progress bars instead of overwriting them.
+    # Install a tqdm lock so that bar redraws from multiple threads don't
+    # interleave and corrupt the terminal output. The logging handler
+    # (TqdmLoggingHandler, installed in cli.py) routes all log records
+    # through tqdm.write(), which also respects this lock -- so log lines
+    # from this function *and* from provider code (e.g. ms_provider.py's
+    # "Uploading ..." messages) are always printed as clean, complete lines
+    # above the active progress bars instead of colliding with them.
     if concurrency > 1:
         tqdm.set_lock(threading.Lock())
 
-    _tqdm_write_lock = threading.Lock()
-
-    def _log(msg: str) -> None:
-        if concurrency > 1:
-            with _tqdm_write_lock:
-                tqdm.write(msg, file=sys.stderr)
-        else:
-            logger.info(msg)
-
-    def _sync_one(f: FileMeta, index: int, position: int = 0) -> None:
-        _log(f"[{index}/{total}] syncing {f.path} ({f.size:,} bytes) ...")
+    def _sync_one(f: FileMeta, index: int, position: int | None = None) -> None:
+        logger.info("[%d/%d] syncing %s (%s bytes) ...", index, total, f.path, f"{f.size:,}")
         stream = src.open_read_stream(src_ref.repo_id, repo_type, revision, f.path)
         progress_stream = ProgressStream(
             stream, total=f.size, desc=f"[{index}/{total}] ↓ {f.path}",
@@ -183,6 +176,7 @@ def run_sync(
             )
         finally:
             buffered_stream.close()
+        logger.info("[%d/%d] done %s", index, total, f.path)
 
     # Suppress SDK print statements (e.g. ModelScope's "Committing file to
     # ...") that go to stdout and would interleave with the tqdm progress
@@ -219,7 +213,7 @@ def run_sync(
                     try:
                         future.result()
                     except Exception as exc:  # noqa: BLE001
-                        _log(f"同步文件 {f.path} 失败：{exc}")
+                        logger.error("同步文件 %s 失败：%s", f.path, exc)
                         errors.append(exc)
 
             if errors:

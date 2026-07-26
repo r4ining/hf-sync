@@ -246,7 +246,7 @@ class MSProvider(Provider):
                     path_in_repo=path_in_repo,
                     revision=revision,
                     commit_message=commit_message,
-                    disable_tqdm=False,
+                    disable_tqdm=True,
                 ),
                 path_in_repo,
             )

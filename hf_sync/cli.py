@@ -6,9 +6,31 @@ import argparse
 import logging
 import sys
 
+from tqdm.auto import tqdm
+
 from hf_sync.providers import get_provider
 from hf_sync.sync import run_sync
 from hf_sync.uri import parse_repo_ref
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """A logging handler that routes records through ``tqdm.write()``.
+
+    Plain ``logging.StreamHandler`` writes directly to the stream, which can
+    collide with an active tqdm progress bar's carriage-return redraw and
+    corrupt the terminal (missing newlines, log text mixed into the bar).
+    ``tqdm.write()`` coordinates with tqdm's internal lock and always clears
+    active bars before writing a full line, then redraws them -- this makes
+    it safe to use from any thread, including provider code that isn't aware
+    of the progress bars at all.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stderr)
+        except Exception:
+            self.handleError(record)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,10 +99,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+        handlers=[handler],
     )
 
     if args.command == "sync":
