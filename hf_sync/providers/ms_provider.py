@@ -262,7 +262,6 @@ class MSProvider(Provider):
                 revision=revision,
                 commit_message=commit_message,
                 disable_tqdm=False,
-                tqdm_desc=f"↑ {path_in_repo}",
             ),
             path_in_repo,
         )
@@ -295,7 +294,6 @@ class MSProvider(Provider):
                     revision=revision,
                     commit_message=commit_message,
                     disable_tqdm=False,
-                    tqdm_desc=f"↑ {path_in_repo}",
                 ),
                 path_in_repo,
             )
