@@ -292,9 +292,10 @@ class MSProvider(Provider):
 
     def _partial_file_path(self, repo_id: str, repo_type: str, revision: str, path_in_repo: str, size: int) -> str:
         key = f"{repo_id}::{repo_type}::{revision}::{path_in_repo}::{size}"
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+        safe_name = path_in_repo.replace("/", "---")
         os.makedirs(_PARTIAL_CACHE_DIR, exist_ok=True)
-        return os.path.join(_PARTIAL_CACHE_DIR, f"{digest}.part")
+        return os.path.join(_PARTIAL_CACHE_DIR, f"{digest}---{safe_name}.part")
 
     def _upload_via_temp_file(
         self,
