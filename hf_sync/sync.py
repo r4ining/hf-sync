@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import fnmatch
 import io
 import logging
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 from tqdm.auto import tqdm
@@ -31,16 +32,52 @@ class Plan:
     to_sync: List[FileMeta]
     unchanged: List[FileMeta]
     extra_in_target: List[FileMeta]
+    skipped: List[FileMeta] = field(default_factory=list)
 
 
-def build_plan(src_files: List[FileMeta], dst_files: List[FileMeta], force: bool) -> Plan:
+# Files that are auto-generated and maintained by each platform independently.
+# They should not be synced because their content differs between platforms
+# (e.g. different LFS tracking rules), which would cause them to be re-uploaded
+# on every run.
+_DEFAULT_EXCLUDES = {".gitattributes"}
+
+
+def _is_excluded(path: str, excludes: set[str]) -> bool:
+    """Check whether *path* matches any exclude pattern.
+
+    Supports exact match, glob patterns (``*``, ``?``, ``[...]`` via
+    :mod:`fnmatch`), and directory prefixes (``dir/`` or ``dir`` matches
+    ``dir/anything``).
+    """
+    for pat in excludes:
+        if path == pat or fnmatch.fnmatch(path, pat):
+            return True
+        # Treat pattern as a directory prefix: "data" or "data/" should
+        # exclude "data/anything".
+        prefix = pat.rstrip("/") + "/"
+        if path.startswith(prefix):
+            return True
+    return False
+
+
+def build_plan(
+    src_files: List[FileMeta],
+    dst_files: List[FileMeta],
+    force: bool,
+    excludes: set[str] | None = None,
+) -> Plan:
+    excludes = excludes or set()
     dst_by_path = {f.path: f for f in dst_files}
     src_paths = {f.path for f in src_files}
 
     to_sync: List[FileMeta] = []
     unchanged: List[FileMeta] = []
+    skipped: List[FileMeta] = []
 
     for f in src_files:
+        if _is_excluded(f.path, excludes):
+            skipped.append(f)
+            continue
         existing = dst_by_path.get(f.path)
         if force or existing is None:
             to_sync.append(f)
@@ -57,8 +94,8 @@ def build_plan(src_files: List[FileMeta], dst_files: List[FileMeta], force: bool
             # side. Treated as already-synced to keep incremental syncs cheap.
             unchanged.append(f)
 
-    extra_in_target = [f for f in dst_files if f.path not in src_paths]
-    return Plan(to_sync=to_sync, unchanged=unchanged, extra_in_target=extra_in_target)
+    extra_in_target = [f for f in dst_files if f.path not in src_paths and not _is_excluded(f.path, excludes)]
+    return Plan(to_sync=to_sync, unchanged=unchanged, extra_in_target=extra_in_target, skipped=skipped)
 
 
 def run_sync(
@@ -76,6 +113,7 @@ def run_sync(
     assume_yes: bool = False,
     delete: bool = False,
     concurrency: int = 5,
+    excludes: set[str] | None = None,
 ) -> Plan:
     logger.info("Listing files on source %s ...", src_ref)
     src_files = src.list_files(src_ref.repo_id, repo_type, revision)
@@ -86,18 +124,21 @@ def run_sync(
     dst_exists = dst.repo_exists(dst_ref.repo_id, repo_type)
     dst_files = dst.list_files(dst_ref.repo_id, repo_type, dst_revision) if dst_exists else []
 
-    plan = build_plan(src_files, dst_files, force=force)
+    excludes = (excludes or set()) | _DEFAULT_EXCLUDES
+    plan = build_plan(src_files, dst_files, force=force, excludes=excludes)
 
     to_delete = plan.extra_in_target if delete else []
 
     logger.info(
         "Plan: source has %d file(s) total -- %d already up-to-date on target (skipped), "
-        "%d remaining to sync (upload/overwrite); %d extra file(s) exist only on target (%s).",
+        "%d remaining to sync (upload/overwrite); %d extra file(s) exist only on target (%s)"
+        "%s.",
         len(src_files),
         len(plan.unchanged),
         len(plan.to_sync),
         len(plan.extra_in_target),
         f"will delete {len(to_delete)}" if delete else "not deleted",
+        f"; {len(plan.skipped)} file(s) excluded" if plan.skipped else "",
     )
 
     if dry_run:

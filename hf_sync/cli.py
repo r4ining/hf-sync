@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Assume 'yes' to the overwrite/create confirmation prompt (non-interactive)",
     )
+    sync_p.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Path/glob/dir to exclude from sync, e.g. 'data/' excludes all under data/ (can be repeated). .gitattributes is excluded by default.",
+    )
     sync_p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     return parser
@@ -136,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 assume_yes=args.yes,
                 delete=args.delete,
                 concurrency=args.concurrency,
+                excludes=set(args.exclude) if args.exclude else None,
             )
         except Exception as exc:  # surface a clean error instead of a traceback
             logging.error("hf-sync failed: %s", exc)
