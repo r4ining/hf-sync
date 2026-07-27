@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import IO, List, Optional
 
 import requests
@@ -15,9 +17,16 @@ from huggingface_hub.utils import (
 )
 
 from hf_sync.providers.base import FileMeta, Provider
+from hf_sync.providers.resumable import (
+    LARGE_FILE_SPOOL_THRESHOLD,
+    partial_file_path,
+    spool_to_file,
+)
 from hf_sync.remote_stream import RemoteReadStream
 
 _HF_ENDPOINT = "https://huggingface.co"
+
+logger = logging.getLogger("hf_sync")
 
 # huggingface_hub shows its own tqdm progress bar for uploads/downloads by
 # default. We already render a single unified progress bar per file via
@@ -90,6 +99,9 @@ class HFProvider(Provider):
         size: int,
         commit_message: str,
     ) -> None:
+        if size > LARGE_FILE_SPOOL_THRESHOLD:
+            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, size, commit_message)
+            return
         self.api.upload_file(
             path_or_fileobj=stream,
             path_in_repo=path_in_repo,
@@ -98,6 +110,53 @@ class HFProvider(Provider):
             revision=revision,
             commit_message=commit_message,
         )
+
+    def _partial_file_path(self, repo_id: str, repo_type: str, revision: str, path_in_repo: str, size: int) -> str:
+        key = f"hf::{repo_id}::{repo_type}::{revision}::{path_in_repo}::{size}"
+        return partial_file_path(key, path_in_repo)
+
+    def _upload_via_temp_file(
+        self,
+        repo_id: str,
+        repo_type: str,
+        revision: str,
+        path_in_repo: str,
+        stream: IO[bytes],
+        size: int,
+        commit_message: str,
+    ) -> None:
+        # Stable (not random) path: an interrupted run leaves a ``.part``
+        # file behind here that a later sync of the same file can resume
+        # from, instead of a throwaway tempfile that's always discarded.
+        tmp_path = self._partial_file_path(repo_id, repo_type, revision, path_in_repo, size)
+        already_complete = spool_to_file(stream, tmp_path, size, label=path_in_repo)
+        if not already_complete:
+            # Close the download progress bar (on the ProgressStream wrapper)
+            # before starting the upload so the SDK's own upload bar doesn't
+            # conflict with a stale 100% download bar on the same line.
+            stream.close()
+        logger.info("Uploading %s to Hugging Face ...", path_in_repo)
+        try:
+            self.api.upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                revision=revision,
+                commit_message=commit_message,
+            )
+        except Exception:
+            # Keep the fully-downloaded partial file on disk -- a later
+            # sync run can upload it directly without re-downloading.
+            logger.warning(
+                "Upload of %s failed; keeping local partial file so the next sync run can resume it.",
+                path_in_repo,
+            )
+            raise
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     def delete_files(
         self,

@@ -12,10 +12,10 @@ local dir" requirement.
 from __future__ import annotations
 
 import os
-import shutil
 from typing import IO, List, Optional
 
 from hf_sync.providers.base import FileMeta, Provider
+from hf_sync.providers.resumable import spool_to_file
 
 
 class LocalProvider(Provider):
@@ -55,9 +55,14 @@ class LocalProvider(Provider):
     ) -> None:
         full_path = os.path.join(repo_id, path_in_repo)
         os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+        # Stable (not random) path next to the final destination: an
+        # interrupted download leaves a ``.part`` file behind that a later
+        # sync of the same file can resume from -- via an HTTP Range request
+        # against the source -- instead of restarting from byte 0.
         tmp_path = full_path + ".part"
-        with open(tmp_path, "wb") as out:
-            shutil.copyfileobj(stream, out, length=16 * 1024 * 1024)
+        already_complete = spool_to_file(stream, tmp_path, size, label=path_in_repo)
+        if not already_complete:
+            stream.close()
         os.replace(tmp_path, full_path)
 
     def delete_files(
