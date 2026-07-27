@@ -13,7 +13,16 @@ hf-sync sync --repo-type dataset hf:<namespace>/<repo> ms:<namespace>/<repo>
 
 # 反向同步同理
 hf-sync sync ms:<namespace>/<repo> hf:<namespace>/<repo>
+
+# 也可以作为纯下载/上传工具：把 hf/ms 上的模型/数据集下载到本地目录
+hf-sync sync --repo-type dataset hf:TianxingChen/RoboTwin2.0 /path/to/local/dir
+
+# 把本地目录上传到 hf/ms（不存在则自动创建仓库）
+hf-sync sync --repo-type dataset /path/to/local/dir hf:TianxingChen/RoboTwin2.0
 ```
+
+`source`/`target` 只要不是 `hf:`/`ms:` 开头，就会被当作本地目录路径；此时不会经过临时中转目录，
+文件会直接读取/写入到该本地目录（详见[「本地目录支持」](#本地目录支持)）。
 
 ## 为什么需要 hf-sync
 
@@ -99,6 +108,29 @@ Hugging Face 和 ModelScope 是目前最常用的两个模型 / 数据集托管�
 **建议**：如果本地带宽有限，把 `hf-sync` 放到一台带宽更好、离目标机房更近的云主机上运行（阿里云/腾讯云/
 AWS 等），而不是家庭网络或笔记本本地网络，可以显著提速并且不占用你本机的带宽。
 
+## 本地目录支持
+
+`source`/`target` 除了 `hf:<repo>` / `ms:<repo>` 外，也可以直接写一个本地目录路径，这样 `hf-sync`
+就能当作一个纯粹的下载/上传工具使用：
+
+```bash
+# 下载：hf/ms 上的仓库 -> 本地目录
+hf-sync sync --repo-type dataset [--ms-token $MS_TOKEN] [--hf-token $HF_TOKEN] \
+  hf:TianxingChen/RoboTwin2.0 /path/to/local/dir
+
+# 上传：本地目录 -> hf/ms 上的仓库
+hf-sync sync --repo-type dataset [--ms-token $MS_TOKEN] [--hf-token $HF_TOKEN] \
+  /path/to/local/dir hf:TianxingChen/RoboTwin2.0
+```
+
+- 本地目录不存在时，作为下载目标会自动创建；作为上传源则要求目录已存在且非空。
+- 涉及本地目录的这一侧**不经过系统临时目录中转**，文件会直接读取/写入到该目录本身
+  （写入时先写入同目录下的 `<文件名>.part` 临时文件，成功后原子 rename，避免中断留下半个文件）。
+- 增量对比、`--dry-run`、`--force`、`--delete`、`--exclude`、`--concurrency` 等选项对本地目录同样生效；
+  由于本地文件默认不计算内容哈希，增量对比会按「路径 + 文件大小」判断是否需要重新传输。
+- `--revision` / `--dst-revision` 对本地目录一侧无意义，会被忽略。
+- source 和 target 不能同时是本地目录。
+
 ## 安装
 
 ```bash
@@ -167,8 +199,8 @@ Hugging Face 和 ModelScope 均不提供服务器到服务器的 "从 URL 导入
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `source` | 源仓库引用，格式为 `hf:<namespace>/<repo>` 或 `ms:<namespace>/<repo>` | — |
-| `target` | 目标仓库引用，格式同上 | — |
+| `source` | 源引用：`hf:<namespace>/<repo>`、`ms:<namespace>/<repo>`，或本地目录路径 | — |
+| `target` | 目标引用，格式同上 | — |
 | `--repo-type` | 仓库类型：`model` 或 `dataset` | `model` |
 | `--hf-token` | Hugging Face 访问令牌 | 无 |
 | `--ms-token` | ModelScope 访问令牌 | 无 |
@@ -179,19 +211,21 @@ Hugging Face 和 ModelScope 均不提供服务器到服务器的 "从 URL 导入
 | `--delete` | 删除目标仓库中源端已不存在的多余文件，使两端完全一致 | 否 |
 | `--concurrency` | 同时并发传输的文件数（多个下载/上传流水线并行），用于跑满上下行带宽 | `5` |
 | `--dry-run` | 仅打印同步计划，不实际传输 | 否 |
-| `--private` | 如果需要创建目标仓库，则创建为私有仓库 | 否 |
+| `--private` | 如果需要创建目标仓库，则创建为私有仓库（默认行为，此参数用于显式声明） | 是（默认私有） |
+| `--public` | 如果需要创建目标仓库，则创建为公开仓库，覆盖默认的私有行为 | 否 |
 | `-y` / `--yes` | 跳过覆盖/创建确认提示，直接执行 | 否 |
 | `--exclude` | 排除指定路径/glob/目录不参与同步，可重复使用（如 `--exclude data/` 排除 data/ 下所有文件）。`.gitattributes` 默认排除 | 无 |
 | `-v` / `--verbose` | 输出详细日志 | 否 |
 
 ## 项目结构
 
-- `hf_sync/uri.py` — 解析 `hf:` / `ms:` 仓库引用
+- `hf_sync/uri.py` — 解析 `hf:` / `ms:` 仓库引用，或本地目录路径
 - `hf_sync/remote_stream.py` — 可重新打开的流式文件对象
-- `hf_sync/providers/` — `HFProvider` / `MSProvider`：列出文件、打开读取流、创建仓库、上传
+- `hf_sync/providers/` — `HFProvider` / `MSProvider` / `LocalProvider`：列出文件、打开读取流、创建仓库、上传
   - `hf_sync/providers/base.py` — Provider 抽象基类
   - `hf_sync/providers/hf_provider.py` — Hugging Face Provider 实现
   - `hf_sync/providers/ms_provider.py` — ModelScope Provider 实现
+  - `hf_sync/providers/local_provider.py` — 本地文件系统 Provider 实现
 - `hf_sync/sync.py` — 差异比较与传输编排
 - `hf_sync/cli.py` — 命令行入口
 

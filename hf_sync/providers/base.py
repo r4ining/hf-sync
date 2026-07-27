@@ -6,8 +6,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import IO, List, Optional
 
-from hf_sync.remote_stream import RemoteReadStream
-
 
 @dataclass
 class FileMeta:
@@ -39,8 +37,8 @@ class Provider(ABC):
         """Create the target repo if it does not already exist."""
 
     @abstractmethod
-    def open_read_stream(self, repo_id: str, repo_type: str, revision: str, path: str) -> RemoteReadStream:
-        """Return a re-openable stream that reads ``path`` from the repo, on demand."""
+    def open_read_stream(self, repo_id: str, repo_type: str, revision: str, path: str) -> IO[bytes]:
+        """Return a re-openable, seekable stream that reads ``path`` from the repo, on demand."""
 
     @abstractmethod
     def upload(

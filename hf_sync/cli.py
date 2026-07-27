@@ -42,10 +42,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_p = subparsers.add_parser(
         "sync",
-        help="Sync a repo from source to target, e.g. 'hf-sync sync hf:<repo> ms:<repo>'",
+        help=(
+            "Sync a repo from source to target, e.g. 'hf-sync sync hf:<repo> ms:<repo>'. "
+            "Either side can also be a local directory to download/upload, e.g. "
+            "'hf-sync sync hf:<repo> /local/dir' or 'hf-sync sync /local/dir hf:<repo>'."
+        ),
     )
-    sync_p.add_argument("source", help="Source repo ref, e.g. hf:<namespace>/<repo> or ms:<namespace>/<repo>")
-    sync_p.add_argument("target", help="Target repo ref, e.g. hf:<namespace>/<repo> or ms:<namespace>/<repo>")
+    sync_p.add_argument(
+        "source",
+        help="Source ref: hf:<namespace>/<repo>, ms:<namespace>/<repo>, or a local directory path",
+    )
+    sync_p.add_argument(
+        "target",
+        help="Target ref: hf:<namespace>/<repo>, ms:<namespace>/<repo>, or a local directory path",
+    )
     sync_p.add_argument(
         "--repo-type",
         choices=["model", "dataset"],
@@ -79,7 +89,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of files to transfer concurrently (parallel download+upload pipelines). Default: 5",
     )
     sync_p.add_argument("--dry-run", action="store_true", help="Only print what would be synced")
-    sync_p.add_argument("--private", action="store_true", help="Create the target repo as private if it needs creating")
+    sync_p.add_argument(
+        "--public",
+        dest="private",
+        action="store_false",
+        default=True,
+        help="Create the target repo as public if it needs creating (default: private)",
+    )
+    sync_p.add_argument(
+        "--private",
+        dest="private",
+        action="store_true",
+        help="Create the target repo as private if it needs creating (this is the default)",
+    )
     sync_p.add_argument(
         "-y",
         "--yes",
@@ -98,7 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_revision(platform: str) -> str:
-    return "main" if platform == "hf" else "master"
+    if platform == "hf":
+        return "main"
+    if platform == "ms":
+        return "master"
+    return ""  # "local" has no revision concept; unused by LocalProvider
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,7 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         src_ref = parse_repo_ref(args.source)
         dst_ref = parse_repo_ref(args.target)
 
-        tokens = {"hf": args.hf_token, "ms": args.ms_token}
+        if src_ref.platform == "local" and dst_ref.platform == "local":
+            logging.error("hf-sync failed: source and target cannot both be local paths.")
+            return 1
+
+        tokens = {"hf": args.hf_token, "ms": args.ms_token, "local": None}
         src_provider = get_provider(src_ref.platform, tokens[src_ref.platform])
         dst_provider = get_provider(dst_ref.platform, tokens[dst_ref.platform])
 
