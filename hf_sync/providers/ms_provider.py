@@ -54,6 +54,22 @@ _LARGE_FILE_SPOOL_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
 _PARTIAL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "hf-sync-partial")
 
 
+def partial_cache_info() -> tuple[str, int, int]:
+    """Return ``(path, total_size_bytes, file_count)`` for the partial-download cache dir.
+
+    If the directory does not exist or is empty, returns ``(path, 0, 0)``.
+    """
+    total_size = 0
+    file_count = 0
+    if os.path.isdir(_PARTIAL_CACHE_DIR):
+        for name in os.listdir(_PARTIAL_CACHE_DIR):
+            fp = os.path.join(_PARTIAL_CACHE_DIR, name)
+            if os.path.isfile(fp):
+                total_size += os.path.getsize(fp)
+                file_count += 1
+    return _PARTIAL_CACHE_DIR, total_size, file_count
+
+
 def _unwrap_remote_stream(stream: IO[bytes]) -> Optional[RemoteReadStream]:
     """Reach through BufferedReader(ProgressStream(RemoteReadStream(...))) wrapping."""
     raw = getattr(stream, "raw", stream)
@@ -355,6 +371,11 @@ class MSProvider(Provider):
                 # requests -- discard and start over from scratch.
                 os.remove(tmp_path)
 
+        logger.info(
+            "Spooling %s (%s bytes) to local temp file: %s%s",
+            path_in_repo, f"{size:,}", tmp_path,
+            f", resuming from {resume_offset:,} bytes" if resume_offset else "",
+        )
         mode = "ab" if resume_offset else "wb"
         with open(tmp_path, mode) as tmp:
             shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)

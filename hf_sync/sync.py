@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from hf_sync.progress import ProgressStream, set_current_position
 from hf_sync.providers.base import FileMeta, Provider
+from hf_sync.providers.ms_provider import partial_cache_info
 from hf_sync.uri import RepoRef
 
 logger = logging.getLogger("hf_sync")
@@ -278,4 +279,14 @@ def run_sync(
         )
 
     logger.info("Done. Synced %d file(s), deleted %d file(s).", len(plan.to_sync), len(to_delete))
+
+    cache_path, cache_size, cache_count = partial_cache_info()
+    if cache_count > 0:
+        logger.warning(
+            "本地临时缓存目录 %s 中仍有 %d 个未完成的断点续传文件，"
+            "占用磁盘 %s 字节。下次同步相同文件时会自动续传；"
+            "如需释放磁盘空间，可手动删除该目录。",
+            cache_path, cache_count, f"{cache_size:,}",
+        )
+
     return plan
