@@ -94,6 +94,17 @@ class ProgressStream(io.RawIOBase):
             self._bar.update(len(data))
         return data
 
+    def set_progress(self, n: int) -> None:
+        """Manually advance the bar to ``n`` bytes.
+
+        Used when resuming a partially-downloaded transfer whose already-
+        downloaded bytes bypass this stream's own ``read()`` (e.g. bytes
+        already spooled to a local partial file in a previous run).
+        """
+        if self._bar is not None:
+            self._bar.n = n
+            self._bar.refresh()
+
     def readinto(self, b) -> int:  # type: ignore[override]
         n = self._inner.readinto(b)
         if self._bar is not None:

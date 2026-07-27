@@ -70,11 +70,13 @@ class HFProvider(Provider):
 
     def open_read_stream(self, repo_id: str, repo_type: str, revision: str, path: str) -> RemoteReadStream:
         url = self._resolve_url(repo_id, repo_type, revision, path)
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        base_headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
-        def opener() -> requests.Response:
-            resp = requests.get(url, headers=headers, stream=True, allow_redirects=True)
-            return resp
+        def opener(offset: int = 0) -> requests.Response:
+            headers = dict(base_headers)
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+            return requests.get(url, headers=headers, stream=True, allow_redirects=True)
 
         return RemoteReadStream(opener)
 

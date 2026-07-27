@@ -28,11 +28,17 @@ DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
 
 class RemoteReadStream(io.RawIOBase):
-    """File-like object that streams bytes from a remote URL on demand."""
+    """File-like object that streams bytes from a remote URL on demand.
+
+    ``opener`` is called with a byte offset (0 for a normal open) and must
+    issue the GET request, sending an HTTP ``Range: bytes=<offset>-`` header
+    whenever the offset is non-zero so the source can resume a partial
+    transfer instead of restarting from the beginning.
+    """
 
     def __init__(
         self,
-        opener: Callable[[], requests.Response],
+        opener: Callable[[int], requests.Response],
         *,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
@@ -43,16 +49,35 @@ class RemoteReadStream(io.RawIOBase):
         self._iterator = None
         self._buffer = b""
         self._pos = 0
-        self._open()
+        self.resume_supported = True
+        self._open(0)
 
     # -- internal helpers -------------------------------------------------
-    def _open(self) -> None:
+    def _open(self, offset: int = 0) -> None:
         self._close_response()
-        self._response = self._opener()
+        self._response = self._opener(offset)
         self._response.raise_for_status()
-        self._iterator = self._response.iter_content(chunk_size=self._chunk_size)
         self._buffer = b""
-        self._pos = 0
+        if offset and self._response.status_code != 206:
+            # The server ignored our Range request and sent the full body
+            # back from byte 0 instead. Let the caller know so it can
+            # discard any locally-cached bytes and restart from scratch.
+            self.resume_supported = False
+            self._pos = 0
+        else:
+            self.resume_supported = True
+            self._pos = offset
+        self._iterator = self._response.iter_content(chunk_size=self._chunk_size)
+
+    def reopen_from(self, offset: int) -> bool:
+        """Re-issue the GET request starting at ``offset`` bytes.
+
+        Returns ``True`` if the server honored the Range request (HTTP 206)
+        and reading will continue from ``offset``; returns ``False`` if the
+        server ignored it and sent the full body from byte 0 instead.
+        """
+        self._open(offset)
+        return self.resume_supported
 
     def _close_response(self) -> None:
         if self._response is not None:

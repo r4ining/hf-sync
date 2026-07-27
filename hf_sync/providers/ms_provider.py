@@ -14,6 +14,7 @@ provides.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -26,7 +27,7 @@ from urllib.parse import urlparse
 import requests
 from tqdm.auto import tqdm
 
-from hf_sync.progress import get_current_position
+from hf_sync.progress import ProgressStream, get_current_position
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.remote_stream import RemoteReadStream
 
@@ -44,6 +45,26 @@ logger = logging.getLogger("hf_sync")
 # which can OOM-kill the process. Above this size we spool through a local
 # temp file instead, so the SDK takes its disk-based, chunked-hashing path.
 _LARGE_FILE_SPOOL_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
+
+# Large files are spooled into this directory instead of a random tempfile
+# so that a partially-downloaded ``.part`` file survives an interrupted
+# sync run (Ctrl-C, network failure, process crash, etc.) and can be resumed
+# -- via an HTTP Range request against the source -- the next time the same
+# file is synced, instead of re-downloading it from scratch.
+_PARTIAL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "hf-sync-partial")
+
+
+def _unwrap_remote_stream(stream: IO[bytes]) -> Optional[RemoteReadStream]:
+    """Reach through BufferedReader(ProgressStream(RemoteReadStream(...))) wrapping."""
+    raw = getattr(stream, "raw", stream)
+    inner = getattr(raw, "_inner", None)
+    return inner if isinstance(inner, RemoteReadStream) else None
+
+
+def _unwrap_progress_stream(stream: IO[bytes]) -> Optional[ProgressStream]:
+    raw = getattr(stream, "raw", stream)
+    return raw if isinstance(raw, ProgressStream) else None
+
 
 _COMMIT_LOCK_MAX_RETRIES = 5
 _COMMIT_LOCK_BASE_DELAY = 2  # seconds
@@ -221,10 +242,13 @@ class MSProvider(Provider):
 
     def open_read_stream(self, repo_id: str, repo_type: str, revision: str, path: str) -> RemoteReadStream:
         url = self._download_url(repo_id, repo_type, path)
-        headers = self._headers()
+        base_headers = self._headers()
         params = {"Revision": revision, "FilePath": path}
 
-        def opener() -> requests.Response:
+        def opener(offset: int = 0) -> requests.Response:
+            headers = dict(base_headers)
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
             return self._session.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
 
         return RemoteReadStream(opener)
@@ -240,7 +264,7 @@ class MSProvider(Provider):
         commit_message: str,
     ) -> None:
         if size > _LARGE_FILE_SPOOL_THRESHOLD:
-            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, commit_message)
+            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, size, commit_message)
             return
         # The SDK reads small files fully into memory anyway (it checks
         # isinstance(path_or_fileobj, io.BufferedIOBase) and calls .read())
@@ -266,6 +290,12 @@ class MSProvider(Provider):
             path_in_repo,
         )
 
+    def _partial_file_path(self, repo_id: str, repo_type: str, revision: str, path_in_repo: str, size: int) -> str:
+        key = f"{repo_id}::{repo_type}::{revision}::{path_in_repo}::{size}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        os.makedirs(_PARTIAL_CACHE_DIR, exist_ok=True)
+        return os.path.join(_PARTIAL_CACHE_DIR, f"{digest}.part")
+
     def _upload_via_temp_file(
         self,
         repo_id: str,
@@ -273,18 +303,66 @@ class MSProvider(Provider):
         revision: str,
         path_in_repo: str,
         stream: IO[bytes],
+        size: int,
         commit_message: str,
     ) -> None:
-        tmp = tempfile.NamedTemporaryFile(prefix="hf-sync-", suffix=".part", delete=False)
-        tmp_path = tmp.name
+        # Stable (not random) path: an interrupted run leaves a ``.part``
+        # file behind here that a later sync of the same file can resume
+        # from, instead of a throwaway tempfile that's always discarded.
+        tmp_path = self._partial_file_path(repo_id, repo_type, revision, path_in_repo, size)
+        remote = _unwrap_remote_stream(stream)
+
+        resume_offset = 0
+        if os.path.exists(tmp_path):
+            existing_size = os.path.getsize(tmp_path)
+            if existing_size == size:
+                # Already fully downloaded locally (likely crashed/interrupted
+                # right before or during the upload step) -- skip straight to
+                # uploading it, no need to touch the source again.
+                logger.info(
+                    "Found fully-downloaded partial file for %s, skipping re-download ...", path_in_repo,
+                )
+                stream.close()
+                self._upload_with_retry(
+                    lambda: self.hub_api.upload_file(
+                        repo_id=repo_id,
+                        repo_type=repo_type,
+                        path_or_fileobj=tmp_path,
+                        path_in_repo=path_in_repo,
+                        revision=revision,
+                        commit_message=commit_message,
+                        disable_tqdm=False,
+                    ),
+                    path_in_repo,
+                )
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return
+            if 0 < existing_size < size and remote is not None and remote.reopen_from(existing_size):
+                resume_offset = existing_size
+                progress = _unwrap_progress_stream(stream)
+                if progress is not None:
+                    progress.set_progress(existing_size)
+                logger.info(
+                    "Resuming interrupted download of %s from %s/%s bytes ...",
+                    path_in_repo, f"{existing_size:,}", f"{size:,}",
+                )
+            else:
+                # Stale, corrupt, or the source doesn't support Range
+                # requests -- discard and start over from scratch.
+                os.remove(tmp_path)
+
+        mode = "ab" if resume_offset else "wb"
+        with open(tmp_path, mode) as tmp:
+            shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)
+        # Close the download progress bar (on the ProgressStream wrapper)
+        # before starting the upload so the SDK's own upload bar doesn't
+        # conflict with a stale 100% download bar on the same line.
+        stream.close()
+        logger.info("Uploading %s to ModelScope ...", path_in_repo)
         try:
-            with tmp:
-                shutil.copyfileobj(stream, tmp, length=16 * 1024 * 1024)
-            # Close the download progress bar (on the ProgressStream wrapper)
-            # before starting the upload so the SDK's own upload bar doesn't
-            # conflict with a stale 100% download bar on the same line.
-            stream.close()
-            logger.info("Uploading %s to ModelScope ...", path_in_repo)
             self._upload_with_retry(
                 lambda: self.hub_api.upload_file(
                     repo_id=repo_id,
@@ -297,11 +375,18 @@ class MSProvider(Provider):
                 ),
                 path_in_repo,
             )
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        except Exception:
+            # Keep the fully-downloaded partial file on disk -- a later
+            # sync run can upload it directly without re-downloading.
+            logger.warning(
+                "Upload of %s failed; keeping local partial file so the next sync run can resume it.",
+                path_in_repo,
+            )
+            raise
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     def _upload_with_retry(self, upload_fn, path_in_repo: str) -> None:
         """Run an upload call and retry on ModelScope's commit-lock conflicts.
