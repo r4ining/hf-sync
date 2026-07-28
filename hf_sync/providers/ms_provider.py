@@ -27,7 +27,6 @@ from tqdm.auto import tqdm
 from hf_sync.progress import get_current_position
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.providers.resumable import (
-    LARGE_FILE_SPOOL_THRESHOLD,
     partial_cache_info,
     partial_file_path,
     spool_to_file,
@@ -231,48 +230,11 @@ class MSProvider(Provider):
 
         return RemoteReadStream(opener)
 
-    def upload(
-        self,
-        repo_id: str,
-        repo_type: str,
-        revision: str,
-        path_in_repo: str,
-        stream: IO[bytes],
-        size: int,
-        commit_message: str,
-    ) -> None:
-        if size > LARGE_FILE_SPOOL_THRESHOLD:
-            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, size, commit_message)
-            return
-        # The SDK reads small files fully into memory anyway (it checks
-        # isinstance(path_or_fileobj, io.BufferedIOBase) and calls .read())
-        # before hashing + uploading. We do that read ourselves so our own
-        # ProgressStream (download phase) can be closed -- freeing its
-        # terminal row -- as soon as it's drained, *before* handing plain
-        # bytes to the SDK. The SDK then creates its own (position-patched)
-        # bar for the actual upload PUT. Without closing ours first, both
-        # bars would claim the same row at the same time and corrupt the
-        # terminal output.
-        data = stream.read()
-        stream.close()
-        self._upload_with_retry(
-            lambda: self.hub_api.upload_file(
-                repo_id=repo_id,
-                repo_type=repo_type,
-                path_or_fileobj=data,
-                path_in_repo=path_in_repo,
-                revision=revision,
-                commit_message=commit_message,
-                disable_tqdm=False,
-            ),
-            path_in_repo,
-        )
-
     def _partial_file_path(self, repo_id: str, repo_type: str, revision: str, path_in_repo: str, size: int) -> str:
         key = f"ms::{repo_id}::{repo_type}::{revision}::{path_in_repo}::{size}"
         return partial_file_path(key, path_in_repo)
 
-    def _upload_via_temp_file(
+    def upload(
         self,
         repo_id: str,
         repo_type: str,

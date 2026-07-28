@@ -18,7 +18,6 @@ from huggingface_hub.utils import (
 
 from hf_sync.providers.base import FileMeta, Provider
 from hf_sync.providers.resumable import (
-    LARGE_FILE_SPOOL_THRESHOLD,
     partial_file_path,
     spool_to_file,
 )
@@ -89,33 +88,11 @@ class HFProvider(Provider):
 
         return RemoteReadStream(opener)
 
-    def upload(
-        self,
-        repo_id: str,
-        repo_type: str,
-        revision: str,
-        path_in_repo: str,
-        stream: IO[bytes],
-        size: int,
-        commit_message: str,
-    ) -> None:
-        if size > LARGE_FILE_SPOOL_THRESHOLD:
-            self._upload_via_temp_file(repo_id, repo_type, revision, path_in_repo, stream, size, commit_message)
-            return
-        self.api.upload_file(
-            path_or_fileobj=stream,
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type=repo_type,
-            revision=revision,
-            commit_message=commit_message,
-        )
-
     def _partial_file_path(self, repo_id: str, repo_type: str, revision: str, path_in_repo: str, size: int) -> str:
         key = f"hf::{repo_id}::{repo_type}::{revision}::{path_in_repo}::{size}"
         return partial_file_path(key, path_in_repo)
 
-    def _upload_via_temp_file(
+    def upload(
         self,
         repo_id: str,
         repo_type: str,

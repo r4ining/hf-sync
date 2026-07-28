@@ -1,20 +1,15 @@
 """A re-openable, file-like wrapper around a remote HTTP GET stream.
 
-This is the core piece that lets us bridge two remote repositories without
-ever writing a complete file to local disk:
+Data is read from the source in chunks and, via
+:func:`hf_sync.providers.resumable.spool_to_file`, written straight into a
+local ``.part`` temp file before being handed to the destination SDK. This
+keeps the source read to a single pass -- providers no longer need to
+re-download the file to rewind, since the SDK reads the spooled local file
+(which is trivially seekable) instead of this stream directly.
 
-* Data is read from the source in chunks and forwarded straight into the
-  destination SDK's upload call (``path_or_fileobj=stream``).
-* Both the Hugging Face and ModelScope upload code paths need to read the
-  file content once to compute its hash and once more to actually transmit
-  it. A live HTTP response is not seekable, so :meth:`seek` (only supported
-  for ``seek(0)``) transparently re-issues the GET request against the
-  source instead of rewinding a buffer. No bytes are ever spooled to disk;
-  at most a small in-flight chunk lives in memory.
-
-The trade-off (explicitly agreed on with the user): whenever a rewind is
-needed, the source file is re-downloaded from the network. Bandwidth cost
-can double, but local disk usage stays at zero regardless of file size.
+:meth:`seek` (only supported for ``seek(0)``) is kept for completeness and
+transparently re-issues the GET request against the source instead of
+rewinding a buffer, since a live HTTP response is not itself seekable.
 """
 
 from __future__ import annotations

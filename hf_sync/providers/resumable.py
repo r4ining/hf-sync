@@ -23,20 +23,20 @@ from hf_sync.remote_stream import RemoteReadStream
 
 logger = logging.getLogger("hf_sync")
 
-# modelscope_hub's upload_file() calls ``path_or_fileobj.read()`` in a single
-# shot to compute the content hash whenever it's given anything other than a
-# str/Path/bytes -- it does NOT chunk-read a file-like object. For large
-# files this fully buffers the entire file in memory, which can OOM-kill the
-# process. Above this size providers spool through a local temp file
-# instead, so the SDK takes its disk-based, chunked-hashing path -- and, as a
-# side effect, this is also what makes resuming an interrupted transfer
-# possible.
-LARGE_FILE_SPOOL_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
-
-# Large files are spooled into this directory instead of a random tempfile
-# so that a partially-downloaded ``.part`` file survives an interrupted
-# sync run (Ctrl-C, network failure, process crash, etc.) and can be resumed
-# -- via an HTTP Range request against the source -- the next time the same
+# Every file is spooled through a local temp file before being handed to the
+# destination SDK. This avoids feeding the SDK a live, non-rewindable HTTP
+# stream directly -- both the Hugging Face and ModelScope upload paths read
+# the file content twice (once to hash it, once to transmit it), and a
+# non-seekable remote stream would otherwise have to be re-downloaded from
+# the source for the second read. Spooling to disk also lets the SDK take
+# its disk-based, chunked-hashing path instead of buffering the whole file
+# in memory, and, as a side effect, is what makes resuming an interrupted
+# transfer possible.
+#
+# Files are spooled into this directory instead of a random tempfile so
+# that a partially-downloaded ``.part`` file survives an interrupted sync
+# run (Ctrl-C, network failure, process crash, etc.) and can be resumed --
+# via an HTTP Range request against the source -- the next time the same
 # file is synced, instead of re-downloading it from scratch.
 PARTIAL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "hf-sync-partial")
 
